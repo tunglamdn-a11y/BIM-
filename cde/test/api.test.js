@@ -66,6 +66,7 @@ test('quy trình CDE đầy đủ qua API', async (t) => {
   assert.strictEqual((await up('v3')).status, 409, 'không tải lên khi đang chờ duyệt');
   assert.strictEqual((await kt('POST', `/api/workflows/${req1.data.workflow.id}/decision`, { approve: true })).status, 403);
   assert.strictEqual((await ktLead('POST', `/api/workflows/${req1.data.workflow.id}/decision`, { approve: true })).status, 200);
+  assert.strictEqual((await kt('POST', `/api/containers/${cid}/transition`, { to: 'PUBLISHED', statusCode: 'constructor' })).status, 400);
 
   let c = (await viewer('GET', `/api/containers/${cid}`)).data;
   assert.strictEqual(c.state, 'SHARED');
@@ -86,7 +87,10 @@ test('quy trình CDE đầy đủ qua API', async (t) => {
   // Sửa đổi mới
   assert.strictEqual((await kt('POST', `/api/containers/${cid}/transition`, { to: 'WIP' })).data.done, true);
   assert.strictEqual((await up('v4')).data.versions[0].revision, 'P02.1');
-  assert.strictEqual((await viewer('GET', `/api/containers/${cid}`)).status, 404);
+  // Đơn vị khác vẫn thấy các bản đã phát hành, nhưng không thấy bản WIP mới
+  c = (await viewer('GET', `/api/containers/${cid}`)).data;
+  assert.deepStrictEqual(c.versions.map((v) => v.revision), ['C01', 'P01']);
+  assert.strictEqual((await viewer('GET', `/api/versions/${c.versions[0].id}/download`)).data, 'v2');
 
   // RFI
   const pmId = (await pm('GET', '/api/me')).data.id;
@@ -101,8 +105,23 @@ test('quy trình CDE đầy đủ qua API', async (t) => {
   const viewerId = (await viewer('GET', '/api/me')).data.id;
   assert.strictEqual((await kt('POST', `/api/projects/${pid}/transmittals`, { subject: 'x', recipientIds: [viewerId], containerIds: [cid] })).status, 400);
 
+  // Người gửi yêu cầu không tự phê duyệt được
+  const own = await pm('POST', `/api/projects/${pid}/containers`, { fields: { originator: 'CDT', volume: 'ZZ', level: 'ZZ', type: 'PL', role: 'K', number: '0002' }, title: 'x' });
+  await pm('PUT', `/api/containers/${own.data.id}/versions`, Buffer.from('x'), { 'X-File-Name': 'x.pdf' });
+  const selfReq = await pm('POST', `/api/containers/${own.data.id}/transition`, { to: 'SHARED', statusCode: 'S2' });
+  assert.strictEqual((await pm('POST', `/api/workflows/${selfReq.data.workflow.id}/decision`, { approve: true })).status, 403);
+
+  // Không hạ cấp người quản lý duy nhất; vai trò kế thừa từ prototype bị từ chối
+  assert.strictEqual((await pm('PUT', `/api/projects/${pid}/members`, { userId: pmId, role: 'viewer' })).status, 400);
+  assert.strictEqual((await pm('PUT', `/api/projects/${pid}/members`, { userId: viewerId, role: 'toString' })).status, 400);
+
+  // Cookie hoặc body lỗi không gây lỗi 500
+  const badCookie = await fetch(`${base}/api/login`, { method: 'POST', headers: { cookie: 'x=100%' }, body: JSON.stringify({ username: 'pm', password: 'demo123' }) });
+  assert.strictEqual(badCookie.status, 200);
+  assert.strictEqual((await fetch(`${base}/api/login`, { method: 'POST', body: 'null' })).status, 400);
+
   const dash = (await pm('GET', `/api/projects/${pid}/dashboard`)).data;
-  assert.strictEqual(dash.byState.WIP, 7);
+  assert.strictEqual(dash.byState.WIP, 8);  // 6 mẫu + 2 container tạo trong bài kiểm tra
   const activity = (await pm('GET', `/api/projects/${pid}/activity`)).data;
   assert.ok(activity.some((a) => a.action === 'transition'));
 });

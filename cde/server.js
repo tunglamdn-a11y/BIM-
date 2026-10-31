@@ -36,11 +36,20 @@ function checkPassword(user, password) {
   return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(user.hash, 'hex'));
 }
 
+// decodeURIComponent ném URIError với chuỗi mã hóa sai (vd. "100%").
+function safeDecode(s, fallback = null) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return fallback;
+  }
+}
+
 function parseCookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i > 0) out[part.slice(0, i).trim()] = safeDecode(part.slice(i + 1).trim(), '');
   }
   return out;
 }
@@ -137,19 +146,20 @@ function createApp(store) {
     };
   }
 
-  // Thêm một bản ghi phiên bản trỏ tới tệp của phiên bản mới nhất, với revision/trạng thái mới.
-  function stampVersion(container, state, statusCode, userId, note) {
+  // Thêm một bản ghi phiên bản trỏ tới tệp của phiên bản đã được gửi duyệt, với revision/trạng thái mới.
+  function stampVersion(container, sourceVersionId, state, statusCode, userId, note) {
     const revisions = container.versions.map((v) => v.revision);
-    const last = container.versions[container.versions.length - 1];
+    const source = container.versions.find((v) => v.id === sourceVersionId);
+    if (!source) fail(409, 'Không tìm thấy phiên bản đã gửi duyệt');
     const revision = state === 'SHARED' ? cde.sharedRevision(revisions) : cde.publishedRevision(revisions);
-    container.versions.push({ ...last, id: store.id(), revision, state, statusCode, by: userId, at: now(), note: note || '' });
+    container.versions.push({ ...source, id: store.id(), revision, state, statusCode, by: userId, at: now(), note: note || '' });
     return revision;
   }
 
-  function applyTransition(container, to, statusCode, userId, note) {
+  function applyTransition(container, to, statusCode, userId, note, sourceVersionId) {
     const from = container.state;
     let revision = null;
-    if (to === 'SHARED' || to === 'PUBLISHED') revision = stampVersion(container, to, statusCode, userId, note);
+    if (to === 'SHARED' || to === 'PUBLISHED') revision = stampVersion(container, sourceVersionId, to, statusCode, userId, note);
     container.state = to;
     container.statusCode = statusCode;
     container.updatedAt = now();
@@ -282,8 +292,10 @@ function createApp(store) {
     const { project } = projectAccess(user, params.pid, 'manager');
     const target = userById(body.userId);
     if (!target) fail(404, 'Không tìm thấy người dùng');
-    if (!cde.PROJECT_ROLES[body.role]) fail(400, 'Vai trò không hợp lệ');
+    if (!cde.isCode(cde.PROJECT_ROLES, body.role)) fail(400, 'Vai trò không hợp lệ');
     const existing = project.members.find((m) => m.userId === target.id);
+    if (existing && body.role !== 'manager' && !project.members.some((m) => m !== existing && m.role === 'manager'))
+      fail(400, 'Dự án cần ít nhất một người quản lý thông tin');
     if (existing) existing.role = body.role;
     else project.members.push({ userId: target.id, role: body.role });
     store.log(project.id, user.id, 'member.set', `${target.name}: ${cde.PROJECT_ROLES[body.role]}`);
@@ -417,7 +429,9 @@ function createApp(store) {
     if (container.state !== 'WIP') fail(409, 'Chỉ tải phiên bản mới khi container ở trạng thái WIP');
     if (!cde.canEditWip(member, user, container)) fail(403, 'Bạn không có quyền tải lên container này');
     if (pendingWorkflow(container.id)) fail(409, 'Container đang chờ phê duyệt, không thể tải lên');
-    const fileName = path.basename(decodeURIComponent(req.headers['x-file-name'] || '')).slice(0, 255);
+    const rawName = safeDecode(req.headers['x-file-name'] || '');
+    if (rawName === null) fail(400, 'Tên tệp không hợp lệ');
+    const fileName = path.basename(rawName).slice(0, 255);
     if (!fileName) fail(400, 'Thiếu tên tệp');
     const storedAs = store.id();
     const dest = store.filePath(storedAs);
@@ -434,8 +448,9 @@ function createApp(store) {
           return;
         }
         hash.update(chunk);
-        out.write(chunk);
+        if (!out.write(chunk)) req.pause();
       });
+      out.on('drain', () => req.resume());
       req.on('end', () => out.end(resolve));
       req.on('error', reject);
       out.on('error', reject);
@@ -446,6 +461,11 @@ function createApp(store) {
     if (size === 0) {
       fs.rmSync(dest, { force: true });
       fail(400, 'Tệp rỗng');
+    }
+    // Trạng thái có thể đã thay đổi trong lúc đang nhận tệp.
+    if (container.state !== 'WIP' || pendingWorkflow(container.id)) {
+      fs.rmSync(dest, { force: true });
+      fail(409, 'Container đã chuyển trạng thái hoặc đang chờ phê duyệt trong lúc tải lên');
     }
     const revision = cde.nextWipRevision(container.versions.map((v) => v.revision));
     container.versions.push({
@@ -495,7 +515,7 @@ function createApp(store) {
     if (!t) fail(400, `Không thể chuyển từ ${container.state} sang ${body.to}`);
     if (pendingWorkflow(container.id)) fail(409, 'Container đã có yêu cầu đang chờ phê duyệt');
     const statusCode = body.to === 'WIP' ? 'S0' : body.to === 'ARCHIVED' ? 'AR' : String(body.statusCode || '');
-    if (!cde.STATUS_CODES[body.to][statusCode]) fail(400, 'Mã tình trạng không hợp lệ cho trạng thái đích');
+    if (!cde.isCode(cde.STATUS_CODES[body.to], statusCode)) fail(400, 'Mã tình trạng không hợp lệ cho trạng thái đích');
     const comment = String(body.comment || '').trim().slice(0, 2000);
 
     if (t.direct) {
@@ -550,6 +570,7 @@ function createApp(store) {
     const { container, role } = containerAccess(user, wf.containerId);
     const t = cde.transition(wf.from, wf.to);
     if (!cde.hasRole(role, t.approverRole)) fail(403, `Cần vai trò "${cde.PROJECT_ROLES[t.approverRole]}" để phê duyệt`);
+    if (body.approve && wf.requestedBy === user.id && !user.isAdmin) fail(403, 'Người gửi yêu cầu không được tự phê duyệt');
     const comment = String(body.comment || '').trim().slice(0, 2000);
     if (!body.approve && !comment) fail(400, 'Vui lòng ghi lý do từ chối');
     if (body.approve && container.state !== wf.from) fail(409, 'Trạng thái container đã thay đổi');
@@ -558,7 +579,7 @@ function createApp(store) {
     wf.decidedAt = now();
     wf.decisionComment = comment;
     if (body.approve) {
-      applyTransition(container, wf.to, wf.statusCode, user.id, comment);
+      applyTransition(container, wf.to, wf.statusCode, user.id, comment, wf.versionId);
     } else {
       store.log(container.projectId, user.id, 'workflow.reject', `Từ chối "${t.label}" cho ${container.name}: ${comment}`);
     }
@@ -571,26 +592,29 @@ function createApp(store) {
   const ISSUE_STATUS = ['open', 'in_progress', 'resolved', 'closed'];
   const PRIORITIES = ['low', 'medium', 'high', 'critical'];
 
-  const issueView = (i) => ({
+  const issueView = (i, user, member) => ({
     ...i,
     createdByName: userName(i.createdBy),
     assigneeName: i.assigneeId ? userName(i.assigneeId) : null,
-    containers: i.containerIds.map((id) => db.containers.find((c) => c.id === id)).filter(Boolean).map((c) => ({ id: c.id, name: c.name, title: c.title })),
+    containers: i.containerIds
+      .map((id) => db.containers.find((c) => c.id === id))
+      .filter((c) => c && cde.canView(member, user, c))
+      .map((c) => ({ id: c.id, name: c.name, title: c.title })),
     comments: i.comments.map((cm) => ({ ...cm, userName: userName(cm.userId) })),
   });
 
   route('GET', '/api/projects/:pid/issues', async ({ user, params }) => {
-    const { project } = projectAccess(user, params.pid);
-    return db.issues.filter((i) => i.projectId === project.id).map(issueView).reverse();
+    const { project, member } = projectAccess(user, params.pid);
+    return db.issues.filter((i) => i.projectId === project.id).map((i) => issueView(i, user, member)).reverse();
   });
 
   route('POST', '/api/projects/:pid/issues', async ({ user, params, body }) => {
-    const { project } = projectAccess(user, params.pid, 'member');
+    const { project, member } = projectAccess(user, params.pid, 'member');
     const type = ISSUE_TYPES.includes(body.type) ? body.type : 'ISSUE';
     if (!String(body.title || '').trim()) fail(400, 'Vui lòng nhập tiêu đề');
     if (body.assigneeId && !project.members.some((m) => m.userId === body.assigneeId)) fail(400, 'Người được giao không thuộc dự án');
     const containerIds = (Array.isArray(body.containerIds) ? body.containerIds : []).filter((id) =>
-      db.containers.some((c) => c.id === id && c.projectId === project.id));
+      db.containers.some((c) => c.id === id && c.projectId === project.id && cde.canView(member, user, c)));
     const n = store.nextSeq(`issue:${project.id}:${type}`);
     const issue = {
       id: store.id(),
@@ -612,13 +636,13 @@ function createApp(store) {
     db.issues.push(issue);
     store.log(project.id, user.id, 'issue.create', `${issue.ref}: ${issue.title}`);
     store.save();
-    return issueView(issue);
+    return issueView(issue, user, member);
   });
 
   route('PATCH', '/api/issues/:iid', async ({ user, params, body }) => {
     const issue = db.issues.find((i) => i.id === params.iid);
     if (!issue) fail(404, 'Không tìm thấy vấn đề');
-    const { project, role } = projectAccess(user, issue.projectId, 'member');
+    const { project, member, role } = projectAccess(user, issue.projectId, 'member');
     const changes = [];
     if (body.status && body.status !== issue.status) {
       if (!ISSUE_STATUS.includes(body.status)) fail(400, 'Trạng thái không hợp lệ');
@@ -646,20 +670,20 @@ function createApp(store) {
       store.log(issue.projectId, user.id, 'issue.update', `${issue.ref}: ${changes.join(', ')}`);
       store.save();
     }
-    return issueView(issue);
+    return issueView(issue, user, member);
   });
 
   route('POST', '/api/issues/:iid/comments', async ({ user, params, body }) => {
     const issue = db.issues.find((i) => i.id === params.iid);
     if (!issue) fail(404, 'Không tìm thấy vấn đề');
-    projectAccess(user, issue.projectId);
+    const { member } = projectAccess(user, issue.projectId);
     const text = String(body.text || '').trim().slice(0, 5000);
     if (!text) fail(400, 'Nội dung trống');
     issue.comments.push({ id: store.id(), userId: user.id, at: now(), text });
     issue.updatedAt = now();
     store.log(issue.projectId, user.id, 'issue.comment', `Bình luận ${issue.ref}`);
     store.save();
-    return issueView(issue);
+    return issueView(issue, user, member);
   });
 
   // ---------------------------------------------------------------- Transmittals
@@ -752,7 +776,9 @@ function createApp(store) {
       req.on('end', () => {
         if (!data) return resolve({});
         try {
-          resolve(JSON.parse(data));
+          const parsed = JSON.parse(data);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return reject(new HttpError(400, 'Dữ liệu phải là đối tượng JSON'));
+          resolve(parsed);
         } catch {
           reject(new HttpError(400, 'JSON không hợp lệ'));
         }
@@ -771,7 +797,9 @@ function createApp(store) {
         if (r.method !== req.method) continue;
         const m = r.re.exec(url.pathname);
         if (m) {
-          match = { r, params: Object.fromEntries(r.keys.map((k, i) => [k, decodeURIComponent(m[i + 1])])) };
+          const params = Object.fromEntries(r.keys.map((k, i) => [k, safeDecode(m[i + 1])]));
+          if (Object.values(params).includes(null)) fail(400, 'Đường dẫn không hợp lệ');
+          match = { r, params };
           break;
         }
       }

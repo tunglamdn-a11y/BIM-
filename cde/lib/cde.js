@@ -108,8 +108,8 @@ function validateFields(fields) {
     const rule = FIELD_RULES[k];
     if (!rule.re.test(fields[k] || '')) errors.push(`${rule.label} không hợp lệ (${rule.hint})`);
   }
-  if (fields.type && !TYPE_CODES[fields.type]) errors.push(`Loại "${fields.type}" không có trong danh mục`);
-  if (fields.role && !ROLE_CODES[fields.role]) errors.push(`Bộ môn "${fields.role}" không có trong danh mục`);
+  if (fields.type && !isCode(TYPE_CODES, fields.type)) errors.push(`Loại "${fields.type}" không có trong danh mục`);
+  if (fields.role && !isCode(ROLE_CODES, fields.role)) errors.push(`Bộ môn "${fields.role}" không có trong danh mục`);
   return errors;
 }
 
@@ -180,16 +180,21 @@ function transition(from, to) {
   return TRANSITIONS[`${from}>${to}`] || null;
 }
 
+// Tra cứu khóa riêng của danh mục (tránh khóa kế thừa như "constructor").
+const isCode = (table, key) => typeof key === 'string' && Object.hasOwn(table, key);
+
 function hasRole(role, minRole) {
-  return role in ROLE_RANK && ROLE_RANK[role] >= ROLE_RANK[minRole];
+  return isCode(ROLE_RANK, role) && isCode(ROLE_RANK, minRole) && ROLE_RANK[role] >= ROLE_RANK[minRole];
 }
 
-// Container WIP chỉ hiển thị cho đơn vị tạo lập và người quản lý thông tin.
+// Container WIP chỉ hiển thị cho đơn vị tạo lập và người quản lý thông tin;
+// nếu container đã từng chia sẻ/phát hành, đơn vị khác vẫn thấy các phiên bản đó.
 function canView(member, user, container) {
   if (user.isAdmin) return true;
   if (!member) return false;
   if (container.state !== 'WIP') return true;
-  return member.role === 'manager' || user.org === container.fields.originator;
+  if (member.role === 'manager' || user.org === container.fields.originator) return true;
+  return (container.versions || []).some((v) => v.state !== 'WIP');
 }
 
 function canEditWip(member, user, container) {
@@ -208,6 +213,7 @@ module.exports = {
   FIELD_RULES,
   FIELD_ORDER,
   TRANSITIONS,
+  isCode,
   normalizeFields,
   validateFields,
   buildName,
