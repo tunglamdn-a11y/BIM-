@@ -1,0 +1,15 @@
+{
+  "name": "bim-cde",
+  "version": "1.0.0",
+  "description": "CDE (Common Data Environment) quản lý dự án BIM theo ISO 19650",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
